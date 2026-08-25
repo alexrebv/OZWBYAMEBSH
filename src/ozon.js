@@ -4,8 +4,9 @@ import { требовать } from './config.js';
 import { запрос, сон, iso, вТаблицу, число, флаг } from './http.js';
 
 const ХОСТ = 'https://api-seller.ozon.ru';
-const ЛИМИТ = 100;      // потолок v4/posting/fbs/list
+const ЛИМИТ = 100;               // потолок v4/posting/fbs/list
 const ПАУЗА = 200;
+const ОКНО_СОЗДАНИЯ_ДНЕЙ = 60;   // since/to обязательны, поэтому берём широкий период
 
 const СТАТУСЫ = {
   acceptance_in_progress: 'Идёт приёмка',
@@ -47,7 +48,8 @@ function вызов(параметры, метод, тело) {
 export async function продажи(параметры, задача) {
   const глубина = задача.глубина || 3;
   const по = new Date();
-  const с = new Date(по.getTime() - глубина * 24 * 3600 * 1000);
+  const статусС = new Date(по.getTime() - глубина * 24 * 3600 * 1000);
+  const созданС = new Date(по.getTime() - ОКНО_СОЗДАНИЯ_ДНЕЙ * 24 * 3600 * 1000);
 
   const отправления = [];
   let курсор = '';
@@ -57,7 +59,12 @@ export async function продажи(параметры, задача) {
       sort_dir: 'ASC',
       limit: ЛИМИТ,
       cursor: курсор,
-      filter: { last_changed_status_date: { from: iso(с), to: iso(по) } },
+      filter: {
+        // since/to метод требует всегда, даже когда фильтруем по смене статуса
+        since: iso(созданС),
+        to: iso(по),
+        last_changed_status_date: { from: iso(статусС), to: iso(по) },
+      },
       with: { analytics_data: true, financial_data: true },
     });
 
@@ -159,23 +166,36 @@ export async function остатки(параметры) {
     await сон(ПАУЗА);
   }
 
-  // артикул по sku пригодится при разбивке по складам
+  // итоги FBS по товару. sku в ответе заполняется не всегда,
+  // поэтому запоминаем и артикул, и то, что удалось найти как идентификатор
+  const итогиFBS = [];
   const артикулПоSku = new Map();
-  const ску = [];
 
   for (const т of товары) {
+    let есть = 0;
+    let резерв = 0;
+    let sku = '';
+
     for (const о of т.stocks || []) {
-      if (String(о.type).toLowerCase() !== 'fbs' || !о.sku) continue;
-      артикулПоSku.set(String(о.sku), т.offer_id || '-');
-      ску.push(Number(о.sku));
+      if (String(о.type).toLowerCase() !== 'fbs') continue;
+      есть += Number(о.present) || 0;
+      резерв += Number(о.reserved) || 0;
+      if (о.sku) sku = String(о.sku);
     }
+
+    if (!sku && т.product_id) sku = String(т.product_id);
+    if (!есть && !резерв) continue;
+
+    if (sku) артикулПоSku.set(sku, т.offer_id || '-');
+    итогиFBS.push({ offer_id: т.offer_id || '-', sku, есть, резерв });
   }
 
   const отметка = вТаблицу(new Date());
   const строки = [];
 
-  // v1 отдаёт ошибку крупным продавцам, поэтому начинаем с v2 и откатываемся
+  // разбивка по складам: v1 отдаёт ошибку крупным продавцам, поэтому начинаем с v2
   let метод = '/v2/product/info/stocks-by-warehouse/fbs';
+  const ску = итогиFBS.map((и) => Number(и.sku)).filter((s) => Number.isFinite(s) && s > 0);
 
   for (let i = 0; i < ску.length; i += 1000) {
     const пачка = ску.slice(i, i + 1000);
@@ -196,10 +216,10 @@ export async function остатки(параметры) {
     const записи = Array.isArray(тело) ? тело : (тело.result || тело.items || []);
 
     for (const з of записи) {
-      const sku = String(з.sku);
+      const s = String(з.sku);
       строки.push([
-        артикулПоSku.get(sku) || з.offer_id || '-',
-        sku,
+        артикулПоSku.get(s) || з.offer_id || '-',
+        s,
         з.warehouse_name || з.warehouse_id || '-',
         Number(з.present) || 0,
         Number(з.reserved) || 0,
@@ -210,6 +230,15 @@ export async function остатки(параметры) {
     await сон(ПАУЗА);
   }
 
+  // если разбивка не отработала — пишем итоги по товару, чтобы расчёт не остался пустым
+  let источник = 'по складам';
+  if (!строки.length && итогиFBS.length) {
+    источник = 'итоги без складов';
+    for (const и of итогиFBS) {
+      строки.push([и.offer_id, и.sku || '-', 'Все склады', и.есть, и.резерв, отметка]);
+    }
+  }
+
   await сохранить(SHEETS.OZON_ОСТАТКИ, строки);
-  return `товаров ${товары.length}, строк по складам ${строки.length}`;
+  return `товаров ${товары.length}, с остатком FBS ${итогиFBS.length}, строк ${строки.length} (${источник})`;
 }
