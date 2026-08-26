@@ -33,7 +33,8 @@ const SHEET_ID = () => {
   return id;
 };
 
-function буква(n) {
+/** Номер колонки → буква: A, B, ... Z, AA. Нужна там, где ширина считается на лету. */
+export function буква(n) {
   let s = '';
   while (n > 0) {
     const о = (n - 1) % 26;
