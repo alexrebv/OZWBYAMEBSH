@@ -1,7 +1,7 @@
 import { SHEETS } from './schemas.js';
 import { сохранить, читать } from './sheets.js';
 import { требовать } from './config.js';
-import { запрос, сон, iso, вТаблицу, число, изЯчейки, изМосквы, мскISO, МСК_СМЕЩЕНИЕ } from './http.js';
+import { запрос, сон, iso, вТаблицу, число, изЯчейки, изМосквы, мскISO, окнами, МСК_СМЕЩЕНИЕ } from './http.js';
 
 /**
  * Выгрузка FBO: заказы и остатки на складах маркетплейсов.
@@ -11,6 +11,7 @@ import { запрос, сон, iso, вТаблицу, число, изЯчейк
 
 const ПАУЗА = 300;
 const ЛИМИТ_ОТПРАВЛЕНИЙ = 100;   // потолок v3/posting/fbo/list, выше — 400
+const ОКНО_ДНЕЙ = 29;            // Яндекс отказывает на периоде длиннее 30 суток
 
 // ═══════════════════════ OZON ═══════════════════════
 // Заказы:  POST /v3/posting/fbo/list   (v2 отключён 31.08.2026)
@@ -35,28 +36,28 @@ export async function ozonFboПродажи(параметры, задача) {
 
   const отправления = [];
   const виденные = new Set();
-  let offset = 0;
+  // Метод курсорный: принимает cursor и sort_dir, а offset и dir просто игнорирует —
+  // из-за этого он бесконечно отдавал одну и ту же первую страницу.
+  let курсор = '';
 
-  for (let страниц = 0; страниц < 300; страниц += 1) {
+  for (let страниц = 0; страниц < 500; страниц += 1) {
     const ответ = await ozonВызов(параметры, '/v3/posting/fbo/list', {
-      dir: 'ASC',
+      sort_dir: 'ASC',
       limit: ЛИМИТ_ОТПРАВЛЕНИЙ,
-      offset,
+      cursor: курсор,
       filter: { since: iso(с), to: iso(по) },
       with: { analytics_data: true, financial_data: true },
     });
     const тело = ответ.result || ответ;
     const пачка = Array.isArray(тело) ? тело : (тело.postings || тело.result || []);
 
-    // Ozon на этом методе умеет игнорировать offset и отдавать одну и ту же страницу.
-    // Без этой проверки цикл выбирал все 300 страниц: 30 000 отправлений, из которых
-    // уникальных сотня, и 139 секунд впустую. Страница без новых номеров — конец выборки.
+    // подстраховка от неподвижной выдачи: страница без новых номеров завершает выборку
     const новые = пачка.filter((о) => о.posting_number && !виденные.has(о.posting_number));
     for (const о of новые) виденные.add(о.posting_number);
     отправления.push(...новые);
 
-    if (!новые.length || пачка.length < ЛИМИТ_ОТПРАВЛЕНИЙ) break;
-    offset += ЛИМИТ_ОТПРАВЛЕНИЙ;
+    if (!новые.length || !тело.has_next || !тело.cursor || тело.cursor === курсор) break;
+    курсор = тело.cursor;
     await сон(ПАУЗА);
   }
 
@@ -299,18 +300,21 @@ export async function ямFboПродажи(параметры, задача) {
   const с = изЯчейки(задача.сдаты) || new Date(по.getTime() - глубина * 24 * 3600 * 1000);
 
   const заказы = [];
-  let токен = '';
-  for (let страниц = 0; страниц < 400; страниц += 1) {
-    const п = new URLSearchParams({ fromDate: датаЯМ(с), toDate: датаЯМ(по), limit: '50' });
-    if (токен) п.set('page_token', токен);
-    const ответ = await ямВызов(параметры, `/orders?${п}`);
-    const тело = ответ.result || ответ;
-    const пачка = тело.orders || [];
-    заказы.push(...пачка);
-    const след = тело.paging?.nextPageToken;
-    if (!след || след === токен || !пачка.length) break;
-    токен = след;
-    await сон(ПАУЗА);
+  // Яндекс отказывает на интервале длиннее 30 суток, поэтому идём окнами
+  for (const [а, б] of окнами(с, по, ОКНО_ДНЕЙ)) {
+    let токен = '';
+    for (let страниц = 0; страниц < 400; страниц += 1) {
+      const п = new URLSearchParams({ fromDate: датаЯМ(а), toDate: датаЯМ(б), limit: '50' });
+      if (токен) п.set('page_token', токен);
+      const ответ = await ямВызов(параметры, `/orders?${п}`);
+      const тело = ответ.result || ответ;
+      const пачка = тело.orders || [];
+      заказы.push(...пачка);
+      const след = тело.paging?.nextPageToken;
+      if (!след || след === токен || !пачка.length) break;
+      токен = след;
+      await сон(ПАУЗА);
+    }
   }
 
   const отметка = вТаблицу(new Date());

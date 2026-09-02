@@ -1,10 +1,11 @@
 import { SHEETS } from './schemas.js';
 import { сохранить } from './sheets.js';
 import { требовать } from './config.js';
-import { запрос, сон, вТаблицу, изЯчейки, изМосквы, МСК_СМЕЩЕНИЕ } from './http.js';
+import { запрос, сон, вТаблицу, изЯчейки, изМосквы, окнами, МСК_СМЕЩЕНИЕ } from './http.js';
 
 const ХОСТ = 'https://api.partner.market.yandex.ru';
 const ПАУЗА = 300;
+const ОКНО_ДНЕЙ = 29;   // /orders отвечает 400, если интервал длиннее 30 суток
 
 const СТАТУСЫ = {
   PLACING: 'Оформляется', RESERVED: 'Зарезервирован', UNPAID: 'Не оплачен',
@@ -60,23 +61,27 @@ export async function продажи(параметры, задача) {
   const с = изЯчейки(задача.сдаты) || new Date(по.getTime() - глубина * 24 * 3600 * 1000);
 
   const заказы = [];
-  let токен = '';
 
-  for (let страниц = 0; страниц < 400; страниц += 1) {
-    const п = new URLSearchParams({
-      fromDate: датаЯМ(с), toDate: датаЯМ(по), limit: '50',
-    });
-    if (токен) п.set('page_token', токен);
+  // период режем на окна: длиннее 30 суток метод не принимает
+  for (const [а, б] of окнами(с, по, ОКНО_ДНЕЙ)) {
+    let токен = '';
 
-    const ответ = await вызов(параметры, `/orders?${п}`);
-    const тело = ответ.result || ответ;
-    const пачка = тело.orders || [];
-    заказы.push(...пачка);
+    for (let страниц = 0; страниц < 400; страниц += 1) {
+      const п = new URLSearchParams({
+        fromDate: датаЯМ(а), toDate: датаЯМ(б), limit: '50',
+      });
+      if (токен) п.set('page_token', токен);
 
-    const след = тело.paging?.nextPageToken;
-    if (!след || след === токен || !пачка.length) break;
-    токен = след;
-    await сон(ПАУЗА);
+      const ответ = await вызов(параметры, `/orders?${п}`);
+      const тело = ответ.result || ответ;
+      const пачка = тело.orders || [];
+      заказы.push(...пачка);
+
+      const след = тело.paging?.nextPageToken;
+      if (!след || след === токен || !пачка.length) break;
+      токен = след;
+      await сон(ПАУЗА);
+    }
   }
 
   const отметка = вТаблицу(new Date());
