@@ -10,6 +10,7 @@ import { запрос, сон, iso, вТаблицу, число, изЯчейк
  */
 
 const ПАУЗА = 300;
+const ЛИМИТ_ОТПРАВЛЕНИЙ = 100;   // потолок v3/posting/fbo/list, выше — 400
 
 // ═══════════════════════ OZON ═══════════════════════
 // Заказы:  POST /v3/posting/fbo/list   (v2 отключён 31.08.2026)
@@ -38,7 +39,7 @@ export async function ozonFboПродажи(параметры, задача) {
   for (let страниц = 0; страниц < 300; страниц += 1) {
     const ответ = await ozonВызов(параметры, '/v3/posting/fbo/list', {
       dir: 'ASC',
-      limit: 1000,
+      limit: ЛИМИТ_ОТПРАВЛЕНИЙ,
       offset,
       filter: { since: iso(с), to: iso(по) },
       with: { analytics_data: true, financial_data: true },
@@ -46,8 +47,8 @@ export async function ozonFboПродажи(параметры, задача) {
     const тело = ответ.result || ответ;
     const пачка = Array.isArray(тело) ? тело : (тело.postings || тело.result || []);
     отправления.push(...пачка);
-    if (пачка.length < 1000) break;
-    offset += 1000;
+    if (пачка.length < ЛИМИТ_ОТПРАВЛЕНИЙ) break;
+    offset += ЛИМИТ_ОТПРАВЛЕНИЙ;
     await сон(ПАУЗА);
   }
 
@@ -107,16 +108,36 @@ export async function ozonFboОстатки(параметры) {
 }
 
 // ═══════════════════════ WILDBERRIES ═══════════════════════
-// Statistics API, отдельный хост и отдельный лимит: 1 запрос в минуту.
-// Заказы:  GET /api/v1/supplier/orders?dateFrom=&flag=0
-// Остатки: GET /api/v1/supplier/stocks?dateFrom=
+// Три разных хоста со своими лимитами.
+// Заказы:   GET  statistics-api      /api/v1/supplier/orders?dateFrom=&flag=0   1 запрос в минуту
+// Остатки:  POST seller-analytics-api /api/analytics/v1/stocks-report/wb-warehouses  3 в минуту
+// Карточки: POST content-api          /content/v2/get/cards/list                100 в минуту
+//
+// Прежний /api/v1/supplier/stocks отключён 23.06.2026 и отвечает 404.
+// Пришедший на замену метод не отдаёт ни штрихкод, ни артикул продавца — только
+// nmId и chrtId, поэтому артикул и баркод добираются из карточек товаров.
 
 const WB_СТАТ = 'https://statistics-api.wildberries.ru';
+const WB_АНАЛИТИКА = 'https://seller-analytics-api.wildberries.ru';
+const WB_КОНТЕНТ = 'https://content-api.wildberries.ru';
+
+const ЛИМИТ_КАРТОЧЕК = 100;      // потолок cursor.limit у карточек
+const ЛИМИТ_ОСТАТКОВ = 250000;   // потолок limit у остатков — весь каталог за один запрос
+const ПАУЗА_АНАЛИТИКИ = 20000;   // 3 запроса в минуту
 
 function wbСтат(параметры, путь) {
   const [ключ] = требовать(параметры, 'WB Api-Key');
   return запрос(WB_СТАТ + путь, { headers: { Authorization: ключ } },
     { имя: `WB ${путь}`, пауза: 20000, попыток: 4 });
+}
+
+function wbПост(параметры, хост, путь, тело, опции = {}) {
+  const [ключ] = требовать(параметры, 'WB Api-Key');
+  return запрос(хост + путь, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: ключ },
+    body: JSON.stringify(тело),
+  }, { имя: `WB ${путь}`, ...опции });
 }
 
 export async function wbFboПродажи(параметры, задача) {
@@ -154,27 +175,78 @@ export async function wbFboПродажи(параметры, задача) {
   return `заказов ${строки.length}, новых ${итог.новых}`;
 }
 
-export async function wbFboОстатки(параметры) {
-  // сервис статистики не хранит историю остатков — только снимок на сейчас
-  const дата = мскISO(new Date(Date.now() - 24 * 3600 * 1000));
-  const ответ = await wbСтат(параметры, `/api/v1/supplier/stocks?dateFrom=${дата}`);
-  const отметка = вТаблицу(new Date());
+/**
+ * Карточки товаров: chrtId (размер) → артикул продавца и баркод.
+ * Метод остатков этих полей не отдаёт, а на листе они есть и по ним идёт стыковка
+ * со справочником, поэтому забираем их отдельно.
+ */
+async function wbКарточки(параметры) {
+  const поРазмеру = new Map();
+  let курсор = { limit: ЛИМИТ_КАРТОЧЕК };
 
-  const строки = (Array.isArray(ответ) ? ответ : [])
-    .filter((с) => Number(с.quantity) > 0 || Number(с.inWayToClient) > 0)
-    .map((с) => [
-      String(с.barcode || ''),
-      с.supplierArticle || '-',
-      с.nmId || '-',
-      с.warehouseName || '-',
-      Number(с.quantity) || 0,
-      Number(с.inWayToClient) || 0,
-      Number(с.inWayFromClient) || 0,
-      отметка,
-    ]);
+  for (let страниц = 0; страниц < 500; страниц += 1) {
+    const ответ = await wbПост(параметры, WB_КОНТЕНТ, '/content/v2/get/cards/list', {
+      settings: { sort: { ascending: true }, filter: { withPhoto: -1 }, cursor: курсор },
+    }, { пауза: 2000 });
+
+    const карточки = ответ.cards || [];
+    for (const к of карточки) {
+      for (const р of к.sizes || []) {
+        поРазмеру.set(String(р.chrtID), {
+          артикул: к.vendorCode || '-',
+          баркод: String((р.skus || [])[0] || ''),
+        });
+      }
+    }
+
+    // WB велит листать, пока total в курсоре ответа не станет меньше запрошенного limit
+    const с = ответ.cursor || {};
+    if (!карточки.length || Number(с.total) < ЛИМИТ_КАРТОЧЕК) break;
+    курсор = { limit: ЛИМИТ_КАРТОЧЕК, updatedAt: с.updatedAt, nmID: с.nmID };
+    await сон(ПАУЗА);
+  }
+
+  return поРазмеру;
+}
+
+export async function wbFboОстатки(параметры) {
+  const поРазмеру = await wbКарточки(параметры);
+
+  const позиции = [];
+  for (let страниц = 0; страниц < 20; страниц += 1) {
+    const ответ = await wbПост(параметры, WB_АНАЛИТИКА, '/api/analytics/v1/stocks-report/wb-warehouses', {
+      limit: ЛИМИТ_ОСТАТКОВ, offset: страниц * ЛИМИТ_ОСТАТКОВ,
+    }, { пауза: ПАУЗА_АНАЛИТИКИ, попыток: 4 });
+
+    // при 204 «нет данных» тело пустое и запрос вернёт {}
+    const пачка = ((ответ.data || ответ).items) || [];
+    позиции.push(...пачка);
+    if (пачка.length < ЛИМИТ_ОСТАТКОВ) break;
+    await сон(ПАУЗА_АНАЛИТИКИ);
+  }
+
+  const отметка = вТаблицу(new Date());
+  const строки = позиции
+    .filter((п) => Number(п.quantity) > 0 || Number(п.inWayToClient) > 0)
+    .map((п) => {
+      const к = поРазмеру.get(String(п.chrtId)) || {};
+      return [
+        к.баркод || '',
+        к.артикул || '-',
+        п.nmId || '-',
+        // сейчас WB отдаёт здесь единственное значение «Склад WB»: разбивки по складам
+        // в новом методе пока нет
+        п.warehouseName || '-',
+        Number(п.quantity) || 0,
+        Number(п.inWayToClient) || 0,
+        Number(п.inWayFromClient) || 0,
+        отметка,
+      ];
+    });
 
   await сохранить(SHEETS.WB_FBO_ОСТАТКИ, строки);
-  return `строк ${строки.length}`;
+  const безАртикула = строки.filter((с) => с[1] === '-').length;
+  return `карточек ${поРазмеру.size}, строк ${строки.length}` + (безАртикула ? `, без артикула ${безАртикула}` : '');
 }
 
 // ═══════════════════════ ЯНДЕКС МАРКЕТ ═══════════════════════
