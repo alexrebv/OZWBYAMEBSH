@@ -1,7 +1,7 @@
 import { SHEETS } from './schemas.js';
 import { сохранить } from './sheets.js';
 import { требовать } from './config.js';
-import { запрос, сон, вТаблицу } from './http.js';
+import { запрос, сон, вТаблицу, изЯчейки, изМосквы, МСК_СМЕЩЕНИЕ } from './http.js';
 
 const ХОСТ = 'https://api.partner.market.yandex.ru';
 const ПАУЗА = 300;
@@ -35,15 +35,21 @@ function вызов(параметры, путь, глагол = 'GET', тело
 
 /** Яндекс ждёт и отдаёт даты как ДД-ММ-ГГГГ. new Date() такое разбирает неверно. */
 const датаЯМ = (д) => {
+  // границу суток считаем по Москве: на UTC-сервере иначе теряется вечер последнего дня
+  const м = new Date(д.getTime() + МСК_СМЕЩЕНИЕ);
   const p = (n) => String(n).padStart(2, '0');
-  return `${p(д.getDate())}-${p(д.getMonth() + 1)}-${д.getFullYear()}`;
+  return `${p(м.getUTCDate())}-${p(м.getUTCMonth() + 1)}-${м.getUTCFullYear()}`;
 };
 
 function изЯМ(строка) {
   if (!строка) return null;
   const м = String(строка).match(/^(\d{2})-(\d{2})-(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?$/);
-  if (!м) return new Date(строка);
-  return new Date(+м[3], +м[2] - 1, +м[1], +(м[4] || 0), +(м[5] || 0), +(м[6] || 0));
+  if (!м) return изМосквы(строка);
+  // Яндекс отдаёт московское время без указания пояса: собираем через Date.UTC
+  // со сдвигом, иначе на UTC-сервере метка уезжает на три часа
+  return new Date(
+    Date.UTC(+м[3], +м[2] - 1, +м[1], +(м[4] || 0), +(м[5] || 0), +(м[6] || 0)) - МСК_СМЕЩЕНИЕ,
+  );
 }
 
 // ─────────────────────── ПРОДАЖИ ───────────────────────
@@ -51,7 +57,7 @@ function изЯМ(строка) {
 export async function продажи(параметры, задача) {
   const глубина = задача.глубина || 14;
   const по = new Date();
-  const с = new Date(по.getTime() - глубина * 24 * 3600 * 1000);
+  const с = изЯчейки(задача.сдаты) || new Date(по.getTime() - глубина * 24 * 3600 * 1000);
 
   const заказы = [];
   let токен = '';

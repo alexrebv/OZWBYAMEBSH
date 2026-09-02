@@ -1,7 +1,7 @@
 import { SHEETS } from './schemas.js';
 import { сохранить, читать, писать, чистить, обеспечитьЛист, буква, штрихкодыИзСправочника } from './sheets.js';
 import { требовать } from './config.js';
-import { запрос, сон, вТаблицу, флаг } from './http.js';
+import { запрос, сон, вТаблицу, флаг, изЯчейки, изМосквы } from './http.js';
 
 const ХОСТ = 'https://marketplace-api.wildberries.ru';
 const ПАУЗА = 250;   // лимит 300 запросов в минуту на категорию «Маркетплейс»
@@ -35,7 +35,8 @@ function вызов(параметры, метод, глагол = 'GET', тел
 export async function продажи(параметры, задача) {
   const глубина = задача.глубина || 7;
   const по = Math.floor(Date.now() / 1000);
-  const с = по - глубина * 24 * 3600;
+  const начало = изЯчейки(задача.сдаты);
+  const с = начало ? Math.floor(начало.getTime() / 1000) : по - глубина * 24 * 3600;
 
   const задания = [];
   let next = 0;
@@ -77,7 +78,7 @@ function строкаИзЗадания(з, отметка) {
     з.supplyId || '-',
     ТИПЫ_ДОСТАВКИ[з.deliveryType] || з.deliveryType || '-',
     флаг(з.cargoType > 1),
-    вТаблицу(з.ddate),
+    вТаблицу(изМосквы(з.ddate)),   // ddate приходит датой без времени и без пояса
     копейки(з.dprice),
     флаг(з.options?.isB2B),
     з.comment || '-',
