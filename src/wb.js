@@ -1,10 +1,11 @@
 import { SHEETS } from './schemas.js';
 import { сохранить, читать, писать, чистить, обеспечитьЛист, буква, штрихкодыИзСправочника } from './sheets.js';
 import { требовать } from './config.js';
-import { запрос, сон, вТаблицу, флаг, изЯчейки, изМосквы } from './http.js';
+import { запрос, сон, вТаблицу, флаг, изЯчейки, изМосквы, окнами } from './http.js';
 
 const ХОСТ = 'https://marketplace-api.wildberries.ru';
 const ПАУЗА = 250;   // лимит 300 запросов в минуту на категорию «Маркетплейс»
+const ОКНО_ДНЕЙ = 29;   // «максимум 30 календарных дней одним запросом» в /api/v3/orders
 
 const СТАТУСЫ_ПРОДАВЦА = {
   new: 'Новое', confirm: 'На сборке', complete: 'В доставке', cancel: 'Отменено продавцом',
@@ -34,22 +35,27 @@ function вызов(параметры, метод, глагол = 'GET', тел
 
 export async function продажи(параметры, задача) {
   const глубина = задача.глубина || 7;
-  const по = Math.floor(Date.now() / 1000);
-  const начало = изЯчейки(задача.сдаты);
-  const с = начало ? Math.floor(начало.getTime() / 1000) : по - глубина * 24 * 3600;
+  const по = new Date();
+  const с = изЯчейки(задача.сдаты) || new Date(по.getTime() - глубина * 24 * 3600 * 1000);
 
   const задания = [];
-  let next = 0;
+  const сек = (д) => Math.floor(д.getTime() / 1000);
 
-  for (let страниц = 0; страниц < 200; страниц += 1) {
-    const url = `/api/v3/orders?limit=1000&next=${next}&dateFrom=${с}&dateTo=${по}`;
-    const ответ = await вызов(параметры, url);
-    const пачка = ответ.orders || [];
-    задания.push(...пачка);
+  // период режем на окна: длиннее 30 календарных дней метод отвечает
+  // 400 IncorrectParameter, причём без указания, какой именно параметр не так
+  for (const [а, б] of окнами(с, по, ОКНО_ДНЕЙ)) {
+    let next = 0;
 
-    if (!пачка.length || !ответ.next || ответ.next === next) break;
-    next = ответ.next;
-    await сон(ПАУЗА);
+    for (let страниц = 0; страниц < 200; страниц += 1) {
+      const url = `/api/v3/orders?limit=1000&next=${next}&dateFrom=${сек(а)}&dateTo=${сек(б)}`;
+      const ответ = await вызов(параметры, url);
+      const пачка = ответ.orders || [];
+      задания.push(...пачка);
+
+      if (!пачка.length || !ответ.next || ответ.next === next) break;
+      next = ответ.next;
+      await сон(ПАУЗА);
+    }
   }
 
   const отметка = вТаблицу(new Date());

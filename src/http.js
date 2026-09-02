@@ -77,6 +77,25 @@ export function мскISO(д) {
   return new Date(д.getTime() + МСК_СМЕЩЕНИЕ).toISOString().slice(0, 19);
 }
 
+/**
+ * Режет период на окна не длиннее заданного числа суток.
+ * WB /api/v3/orders разрешает «максимум 30 календарных дней одним запросом»,
+ * Яндекс /orders отвечает «interval between dateFrom and dateTo is more than 30 days».
+ * Берём с запасом, чтобы не спорить с тем, как каждый из них считает календарные сутки.
+ */
+export function окнами(с, по, дней) {
+  const начало = с instanceof Date ? с.getTime() : new Date(с).getTime();
+  const конец = по instanceof Date ? по.getTime() : new Date(по).getTime();
+  if (!(начало < конец)) return [[new Date(начало), new Date(конец)]];
+
+  const шаг = дней * 24 * 3600 * 1000;
+  const окна = [];
+  for (let а = начало; а < конец; а += шаг) {
+    окна.push([new Date(а), new Date(Math.min(а + шаг, конец))]);
+  }
+  return окна;
+}
+
 /** Даты для API: ISO с Z. */
 export const iso = (д) => new Date(д).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
