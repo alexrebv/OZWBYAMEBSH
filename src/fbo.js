@@ -1,6 +1,7 @@
 import { SHEETS } from './schemas.js';
 import { сохранить, читать } from './sheets.js';
 import { требовать } from './config.js';
+import { разобратьОстатки } from './yandex.js';
 import { запрос, сон, iso, вТаблицу, число, изЯчейки, изМосквы, мскISO, окнами, МСК_СМЕЩЕНИЕ } from './http.js';
 
 /**
@@ -390,8 +391,14 @@ export async function ямFboОстатки(параметры) {
     const тело = ответ.result || ответ;
     for (const с of тело.warehouses || []) {
       const ид = String(с.warehouseId);
-      if (!склады.has(ид)) склады.set(ид, { name: с.name || ид, offers: [] });
-      склады.get(ид).offers.push(...(с.offers || []));
+      if (!склады.has(ид)) склады.set(ид, { name: с.name || ид, offers: new Map() });
+      const куда = склады.get(ид).offers;
+      for (const т of с.offers || []) {
+        // один товар на складе — одна запись. Если страницы перекрылись и товар
+        // пришёл дважды, второй раз заменяет первый, а не добавляется к нему:
+        // иначе на листе было бы две строки с одним ключом и сводная их сложила
+        куда.set(т.offerId || т.shopSku || `#${куда.size}`, т);
+      }
     }
     const след = тело.paging?.nextPageToken;
     if (!след || след === токен) break;
@@ -405,22 +412,20 @@ export async function ямFboОстатки(параметры) {
 
   const отметка = вТаблицу(new Date());
   const строки = [];
+  const неизвестные = new Set();
   for (const склад of склады.values()) {
-    for (const т of склад.offers) {
-      let доступно = 0;
-      let заморожено = 0;
-      let всего = 0;
-      for (const о of т.stocks || []) {
-        const кол = Number(о.count) || 0;
-        всего += кол;
-        if (о.type === 'AVAILABLE' || о.type === 'FIT') доступно += кол;
-        if (о.type === 'FREEZE') заморожено += кол;
-      }
-      if (!всего) continue;
-      строки.push([т.offerId || '-', склад.name, доступно, заморожено, всего, отметка]);
+    for (const т of склад.offers.values()) {
+      // типы остатков у Яндекса вложены друг в друга: FIT = AVAILABLE + FREEZE.
+      // Разбор общий с FBS, чтобы оба листа считали одинаково
+      const о = разобратьОстатки(т.stocks);
+      о.неизвестные.forEach((тип) => неизвестные.add(тип));
+
+      if (!о.всего) continue;
+      строки.push([т.offerId || '-', склад.name, о.доступно, о.заморожено, о.всего, отметка]);
     }
   }
 
   await сохранить(SHEETS.ЯМ_FBO_ОСТАТКИ, строки);
-  return `складов ${склады.size}, строк ${строки.length}`;
+  return `складов ${склады.size}, строк ${строки.length}`
+    + (неизвестные.size ? `, неизвестные типы остатков: ${[...неизвестные].join(', ')}` : '');
 }
